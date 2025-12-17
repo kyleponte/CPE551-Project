@@ -1,316 +1,221 @@
 """
-Data processor module for traffic data I/O operations.
+Data processing utilities for traffic signal volume data.
 
-This module provides functions for loading, processing, and saving traffic data
-with comprehensive exception handling for data validation and I/O errors.
+Combines CSV I/O helpers, cleaning functions, grouping utilities, and
+generators for streaming data in chunks. Merges functionality needed by
+both teammates' commits (file-based streaming + record-level streaming).
 """
 
+from __future__ import annotations
+
+import itertools
+from pathlib import Path
+from typing import Any, Dict, Generator, Iterable, List, Tuple
+
 import pandas as pd
-import os
+
+REQUIRED_COLUMNS = {"intersection_id", "timestamp", "count"}
 
 
-def load_traffic_data(file_path):
+def load_traffic_data(filepath: str | Path) -> pd.DataFrame:
     """
-    Load traffic data from CSV file.
-    
-    Handles FileNotFoundError and other I/O exceptions.
-    Validates that the loaded data is not empty.
-    
-    Args:
-        file_path (str): Path to the CSV file
-    
-    Returns:
-        pd.DataFrame: Loaded traffic data
-    
-    Raises:
-        FileNotFoundError: If the file does not exist
-        ValueError: If the file is empty or invalid
-        pd.errors.EmptyDataError: If the CSV file is empty
-    
-    Example:
-        >>> df = load_traffic_data('data/traffic_signal_data.csv')
-        >>> len(df) > 0
-        True
+    Load traffic signal data from CSV and perform basic cleaning.
+
+    Uses pandas for critical CSV I/O (Part 1 requirement), validates required
+    columns, and ensures timestamps/counts are parsed.
     """
+    path = Path(filepath)
+    if not path.exists():
+        raise FileNotFoundError(f"Traffic data file not found: {path}")
+
     try:
-        # Check if file exists
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Traffic data file not found: {file_path}")
-        
-        # Attempt to read CSV file
-        df = pd.read_csv(file_path)
-        
-        # Validate that data is not empty
+        df = pd.read_csv(path)
         if df.empty:
-            raise ValueError(f"Data file is empty: {file_path}")
-        
+            raise ValueError(f"Data file is empty: {path}")
+
+        _validate_required_columns(df.columns)
+
+        df = df.dropna(subset=["intersection_id", "count"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        df["count"] = pd.to_numeric(df["count"], errors="coerce")
+        df = df.dropna(subset=["count"])
+
         return df
-        
-    except FileNotFoundError as e:
-        # Handle file not found exception (Part 1 requirement)
-        print(f"Error: File not found - {e}")
+    except FileNotFoundError:
         raise
-    except pd.errors.EmptyDataError as e:
-        # Handle empty CSV file
-        print(f"Error: CSV file is empty - {e}")
-        raise ValueError(f"CSV file is empty: {file_path}")
-    except pd.errors.ParserError as e:
-        # Handle CSV parsing errors
-        print(f"Error: Failed to parse CSV file - {e}")
-        raise ValueError(f"Invalid CSV format in file: {file_path}")
-    except Exception as e:
-        # Handle unexpected errors
-        print(f"Unexpected error loading traffic data: {e}")
-        raise
+    except Exception as exc:
+        raise Exception(f"Error loading traffic data: {exc}") from exc
 
 
-def aggregate_by_hour(data):
+def volume_stream(
+    source: str | Path | pd.DataFrame,
+    chunk_size: int = 1000,
+    approach: str | None = None,
+) -> Generator[Any, None, None]:
     """
-    Aggregate data by hour with empty bin handling.
-    
-    Handles empty data bins and missing hour data gracefully.
-    
-    Args:
-        data (pd.DataFrame): Traffic data with 'hour' and 'volume' columns
-    
-    Returns:
-        dict: Hourly aggregates, with 0 for empty bins
-    
-    Raises:
-        ValueError: If data is empty or missing required columns
-    
-    Example:
-        >>> import pandas as pd
-        >>> df = pd.DataFrame({'hour': [8, 9, 10], 'volume': [100, 150, 120]})
-        >>> hourly = aggregate_by_hour(df)
-        >>> hourly[8]
-        100
+    Generator for streaming traffic data.
+
+    Supports two modes:
+    - File path: yields cleaned DataFrame chunks (chunked CSV read).
+    - DataFrame: yields record dictionaries (optionally filtered by approach).
+    """
+    if isinstance(source, (str, Path)):
+        path = Path(source)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+
+        for chunk in pd.read_csv(path, chunksize=chunk_size):
+            _validate_required_columns(chunk.columns)
+            chunk = chunk.dropna(subset=["intersection_id", "count"])
+            chunk["timestamp"] = pd.to_datetime(chunk["timestamp"], errors="coerce")
+            chunk = chunk.dropna(subset=["timestamp"])
+            chunk["count"] = pd.to_numeric(chunk["count"], errors="coerce")
+            chunk = chunk.dropna(subset=["count"])
+            yield chunk
+        return
+
+    df = source
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return
+
+    if approach:
+        if "approach" not in df.columns:
+            raise ValueError("'approach' column not found in data")
+        df = df[df["approach"] == approach]
+
+    for _, row in df.iterrows():
+        yield row.to_dict()
+
+
+def group_by_intersection_and_day(df: pd.DataFrame) -> Dict[Tuple[str, object], List[object]]:
+    """
+    Group traffic records by (intersection_id, day) using itertools.groupby.
+    """
+    _validate_required_columns(df.columns)
+    if "timestamp" not in df.columns:
+        raise ValueError("timestamp column is required for grouping.")
+
+    df_sorted = df.sort_values(["intersection_id", "timestamp"])
+
+    grouped: Dict[Tuple[str, object], List[object]] = {}
+    for key, group in itertools.groupby(
+        df_sorted.itertuples(index=False),
+        key=lambda row: (row.intersection_id, row.timestamp.date()),
+    ):
+        grouped[key] = list(group)
+
+    return grouped
+
+
+def aggregate_by_hour(data: pd.DataFrame, volume_col: str = "count") -> Dict[int, float]:
+    """
+    Aggregate volumes by hour with empty-bin handling.
+    """
+    if data is None or (isinstance(data, pd.DataFrame) and data.empty):
+        raise ValueError("Data is empty, cannot aggregate")
+
+    required_columns = {"hour", volume_col}
+    missing_columns = required_columns.difference(data.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {sorted(missing_columns)}")
+
+    hourly_data: Dict[int, float] = {}
+    for hour in range(24):
+        try:
+            hour_data = data[data["hour"] == hour]
+            hourly_data[hour] = hour_data[volume_col].sum() if not hour_data.empty else 0
+        except Exception:
+            hourly_data[hour] = 0
+
+    return hourly_data
+
+
+def save_results(results: pd.DataFrame | Dict[str, Any], output_path: str | Path) -> None:
+    """
+    Save analysis results to CSV (data I/O requirement).
+
+    Accepts either a DataFrame or a dictionary payload.
     """
     try:
-        # Validate input data
-        if data is None:
-            raise ValueError("Data is None, cannot aggregate")
-        
-        if isinstance(data, pd.DataFrame) and data.empty:
-            raise ValueError("Data is empty, cannot aggregate")
-        
-        # Check for required columns
-        if isinstance(data, pd.DataFrame):
-            required_columns = ['hour', 'volume']
-            missing_columns = [col for col in required_columns if col not in data.columns]
-            if missing_columns:
-                raise ValueError(f"Missing required columns: {missing_columns}")
-        
-        # Initialize hourly data dictionary
-        hourly_data = {}
-        
-        # Process each hour (0-23)
-        for hour in range(24):
-            try:
-                # Filter data for this hour
-                hour_data = data[data['hour'] == hour]
-                
-                if hour_data.empty:
-                    # Handle empty bins (Part 1 requirement)
-                    hourly_data[hour] = 0
-                else:
-                    # Sum volumes for this hour
-                    hourly_data[hour] = hour_data['volume'].sum()
-                    
-            except KeyError:
-                # Handle missing 'hour' or 'volume' column
-                print(f"Warning: Missing data for hour {hour}, using 0")
-                hourly_data[hour] = 0
-            except Exception as e:
-                # Handle unexpected errors for this hour
-                print(f"Warning: Error processing hour {hour}: {e}, using 0")
-                hourly_data[hour] = 0
-        
-        return hourly_data
-        
-    except ValueError as e:
-        print(f"Error in aggregation: {e}")
-        return {}
-    except Exception as e:
-        print(f"Unexpected error in aggregation: {e}")
-        return {}
-
-
-def save_results(results, output_path):
-    """
-    Save analysis results to CSV file.
-    
-    Handles file I/O errors and validates output data.
-    
-    Args:
-        results (pd.DataFrame or dict): Results to save
-        output_path (str): Path to save the results file
-    
-    Raises:
-        ValueError: If results are empty or invalid
-        PermissionError: If file cannot be written
-        OSError: If directory does not exist
-    
-    Example:
-        >>> import pandas as pd
-        >>> results = pd.DataFrame({'metric': ['delay'], 'value': [10.5]})
-        >>> save_results(results, 'outputs/results.csv')
-    """
-    try:
-        # Validate results
         if results is None:
             raise ValueError("Results cannot be None")
-        
-        # Create output directory if it doesn't exist
-        output_dir = os.path.dirname(output_path)
-        if output_dir and not os.path.exists(output_dir):
-            try:
-                os.makedirs(output_dir, exist_ok=True)
-            except OSError as e:
-                raise OSError(f"Cannot create output directory: {e}")
-        
-        # Convert dict to DataFrame if needed
+
         if isinstance(results, dict):
             if not results:
                 raise ValueError("Results dictionary is empty")
             results = pd.DataFrame([results])
-        
-        # Validate DataFrame
-        if isinstance(results, pd.DataFrame):
-            if results.empty:
-                raise ValueError("Results DataFrame is empty")
-        
-        # Save to CSV
+
+        if isinstance(results, pd.DataFrame) and results.empty:
+            raise ValueError("Results DataFrame is empty")
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         results.to_csv(output_path, index=False)
         print(f"Results saved to {output_path}")
-        
-    except ValueError as e:
-        print(f"Error saving results: {e}")
-        raise
-    except PermissionError as e:
-        print(f"Error: Permission denied when writing to {output_path}")
-        raise
-    except OSError as e:
-        print(f"Error: OS error when saving results: {e}")
-        raise
-    except Exception as e:
-        print(f"Unexpected error saving results: {e}")
+    except Exception as exc:
+        print(f"Error saving results to {output_path}: {exc}")
         raise
 
 
-def volume_stream(data, approach=None):
+def clean_traffic_data(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Generator function to stream volume data.
-    
-    Handles empty data and missing columns gracefully.
-    
-    Args:
-        data (pd.DataFrame): Traffic data
-        approach (str, optional): Filter by specific approach
-    
-    Yields:
-        dict: Volume data for each record
-    
-    Example:
-        >>> import pandas as pd
-        >>> df = pd.DataFrame({'approach': ['North'], 'volume': [100]})
-        >>> for record in volume_stream(df):
-        ...     print(record)
-        {'approach': 'North', 'volume': 100}
+    Clean and augment traffic data with time-based features.
+    """
+    _validate_required_columns(df.columns)
+
+    cleaned = df.copy()
+    cleaned = cleaned[cleaned["count"] >= 0]
+    cleaned = cleaned.dropna(subset=["intersection_id", "count"])
+
+    cleaned["timestamp"] = pd.to_datetime(cleaned["timestamp"], errors="coerce")
+    cleaned = cleaned.dropna(subset=["timestamp"])
+    cleaned["count"] = pd.to_numeric(cleaned["count"], errors="coerce")
+    cleaned = cleaned.dropna(subset=["count"])
+
+    cleaned["hour"] = cleaned["timestamp"].dt.hour
+    cleaned["day_of_week"] = cleaned["timestamp"].dt.dayofweek
+
+    return cleaned
+
+
+def validate_traffic_data(data: pd.DataFrame, count_column: str = "count") -> bool:
+    """
+    Validate traffic data for required fields and basic data quality checks.
     """
     try:
-        # Validate input
         if data is None:
             raise ValueError("Data cannot be None")
-        
-        if isinstance(data, pd.DataFrame) and data.empty:
-            print("Warning: Data is empty, no records to stream")
-            return
-        
-        # Filter by approach if specified
-        if approach:
-            if 'approach' not in data.columns:
-                raise ValueError("'approach' column not found in data")
-            filtered_data = data[data['approach'] == approach]
-        else:
-            filtered_data = data
-        
-        # Stream records
-        for index, row in filtered_data.iterrows():
-            try:
-                yield row.to_dict()
-            except Exception as e:
-                print(f"Warning: Error processing row {index}: {e}")
-                continue
-                
-    except ValueError as e:
-        print(f"Error in volume_stream: {e}")
-        return
-    except Exception as e:
-        print(f"Unexpected error in volume_stream: {e}")
-        return
-
-
-def validate_traffic_data(data):
-    """
-    Validate traffic data for required fields and data quality.
-    
-    Checks for missing counts, zero volumes, and invalid data types.
-    
-    Args:
-        data (pd.DataFrame): Traffic data to validate
-    
-    Returns:
-        bool: True if data is valid, False otherwise
-    
-    Raises:
-        ValueError: If data structure is invalid
-    
-    Example:
-        >>> import pandas as pd
-        >>> df = pd.DataFrame({'count': [100, 150], 'volume': [100, 150]})
-        >>> validate_traffic_data(df)
-        True
-    """
-    try:
-        # Validate input
-        if data is None:
-            raise ValueError("Data cannot be None")
-        
         if isinstance(data, pd.DataFrame) and data.empty:
             raise ValueError("Data is empty")
-        
-        # Check for required columns
-        required_columns = ['count', 'volume']
+
         if isinstance(data, pd.DataFrame):
-            missing_columns = [col for col in required_columns if col not in data.columns]
-            if missing_columns:
-                print(f"Warning: Missing columns: {missing_columns}")
+            if count_column not in data.columns:
+                print(f"Warning: Missing column '{count_column}'")
                 return False
-        
-        # Check for missing/zero counts (Part 1 requirement)
-        if 'count' in data.columns:
-            zero_counts = (data['count'] == 0).sum()
-            missing_counts = data['count'].isna().sum()
-            
+
+            zero_counts = (data[count_column] == 0).sum()
+            missing_counts = data[count_column].isna().sum()
             if zero_counts > 0:
                 print(f"Warning: Found {zero_counts} zero counts in data")
             if missing_counts > 0:
                 print(f"Warning: Found {missing_counts} missing counts in data")
-        
-        # Check for negative values
-        numeric_columns = data.select_dtypes(include=['number']).columns
-        for col in numeric_columns:
-            negative_values = (data[col] < 0).sum()
-            if negative_values > 0:
-                print(f"Warning: Found {negative_values} negative values in column '{col}'")
-        
+
+            numeric_columns = data.select_dtypes(include=["number"]).columns
+            for col in numeric_columns:
+                if (data[col] < 0).any():
+                    print(f"Warning: Negative values detected in '{col}'")
+
         return True
-        
-    except ValueError as e:
-        print(f"Error validating data: {e}")
+    except ValueError as exc:
+        print(f"Error validating data: {exc}")
         return False
-    except Exception as e:
-        print(f"Unexpected error validating data: {e}")
+    except Exception as exc:
+        print(f"Unexpected error validating data: {exc}")
         return False
 
+
+def _validate_required_columns(columns: Iterable[str]) -> None:
+    """Ensure required columns exist; raise ValueError if any are missing."""
+    missing = REQUIRED_COLUMNS.difference(set(columns))
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
