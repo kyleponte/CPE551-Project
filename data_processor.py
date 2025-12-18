@@ -219,3 +219,5 @@ def _validate_required_columns(columns: Iterable[str]) -> None:
     missing = REQUIRED_COLUMNS.difference(set(columns))
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
+
+
