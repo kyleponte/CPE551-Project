@@ -205,28 +205,3 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-
-# Project planning files (not for submission)
-HAZEM_COMMITS.md
-KYLE_COMMITS.md
-IMPLEMENTATION_PLAN.md
-MESSAGE_FOR_KYLE.md
-WORKFLOW_INSTRUCTIONS.md
-HOW_TO_RUN.md
-HOW_TO_VIEW_OUTPUTS.md
-REQUIREMENTS_CHECKLIST.md
-
-# Data directory (users download their own data)
-data/*.csv
-data/*.xlsx
-data/*.json
-
-# Outputs (generated files, not source code)
-outputs/*.png
-outputs/*.csv
-
-# Test files in root (should be in tests/ directory)
-test_*.py
-
-# Helper scripts (not part of main project)
-run_notebook.py
